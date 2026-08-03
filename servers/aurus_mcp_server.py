@@ -28,7 +28,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    print("[AURUS MCP] Error: 'mcp' package is missing.", file=sys.stderr)
+    print("[AURUS MCP] Please install it using: pip install mcp", file=sys.stderr)
+    sys.exit(1)
+
 
 from src.hardware.motors import MecanumDriver
 from src.hardware.sensors import ProximitySensor
