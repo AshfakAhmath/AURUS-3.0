@@ -28,11 +28,28 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:
-    print("[AURUS MCP] Error: 'mcp' package is missing.", file=sys.stderr)
-    print("[AURUS MCP] Please install it using: pip install mcp", file=sys.stderr)
+# FastMCP moved between SDK versions — try all known import paths.
+# MCP 1.x:  mcp.server.fastmcp.FastMCP
+# MCP 2.x:  mcp.fastmcp.FastMCP  OR  mcp.FastMCP (top-level)
+FastMCP = None
+for _import_path, _module, _attr in [
+    ("mcp.server.fastmcp", "mcp.server.fastmcp", "FastMCP"),
+    ("mcp.fastmcp",        "mcp.fastmcp",        "FastMCP"),
+    ("mcp",                "mcp",                "FastMCP"),
+]:
+    try:
+        import importlib as _il
+        _mod = _il.import_module(_module)
+        FastMCP = getattr(_mod, _attr, None)
+        if FastMCP is not None:
+            break
+    except ImportError:
+        pass
+
+if FastMCP is None:
+    print("[AURUS MCP] Error: Cannot locate FastMCP in the installed 'mcp' package.", file=sys.stderr)
+    print("[AURUS MCP] Tried: mcp.server.fastmcp, mcp.fastmcp, mcp", file=sys.stderr)
+    print("[AURUS MCP] Install a compatible version: pip install 'mcp>=1.0.0,<2.0.0'", file=sys.stderr)
     sys.exit(1)
 
 
