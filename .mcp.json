@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aurus": {
+      "command": "python",
+      "args": ["servers/aurus_mcp_server.py"]
+    }
+  }
+}

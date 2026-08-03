@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AURUS Evaluation Console</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/evaluation.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">AUTONOMOUS ROBOTIC UBIQUITOUS SYSTEM</p>
+      <h1>AURUS <span>Evaluation Console</span></h1>
+    </div>
+    <div class="top-actions">
+      <span id="connection" class="pill bad">OFFLINE</span>
+      <span id="mode" class="pill">IDLE</span>
+      <button id="estop" class="estop">EMERGENCY STOP</button>
+      <button id="clear-estop" class="secondary">Clear E-Stop</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel camera-panel">
+      <div class="panel-head"><h2>Visual Identity</h2><span id="vision-backend">waiting</span></div>
+      <div class="camera-frame">
+        <img id="camera" src="/video_feed" alt="AURUS camera stream">
+        <div class="identity-card">
+          <span id="identity-status">NO TARGET</span>
+          <strong id="identity-name">Unknown</strong>
+          <small id="identity-confidence">confidence 0.00</small>
+        </div>
+      </div>
+      <div class="enroll-row">
+        <input id="enroll-name" maxlength="80" placeholder="Person's name">
+        <button id="enroll">Enroll face</button>
+      </div>
+      <div class="progress"><div id="enroll-progress"></div></div>
+      <p id="enroll-label" class="muted">Enrollment idle</p>
+    </section>
+
+    <section class="panel awareness-panel">
+      <div class="panel-head"><h2>Spatial Awareness</h2><span id="sensor-age">—</span></div>
+      <canvas id="radar" width="520" height="320"></canvas>
+      <div class="sensor-grid">
+        <div><span>FL</span><strong id="s-fl">—</strong></div>
+        <div><span>FRONT</span><strong id="s-f">—</strong></div>
+        <div><span>FR</span><strong id="s-fr">—</strong></div>
+        <div><span>RL</span><strong id="s-rl">—</strong></div>
+        <div><span>RR</span><strong id="s-rr">—</strong></div>
+      </div>
+      <div class="decision">
+        <span>SAFETY DECISION</span>
+        <strong id="decision">Waiting for telemetry</strong>
+        <small id="motion-vector">final: 0.00 / 0.00 / 0.00</small>
+      </div>
+    </section>
+
+    <section class="panel controls-panel">
+      <div class="panel-head"><h2>Behavior</h2><span>deterministic control</span></div>
+      <div class="mode-grid">
+        <button data-mode="idle">Idle</button>
+        <button data-mode="manual">Manual</button>
+        <button data-mode="following">Follow</button>
+        <button data-mode="exploring">Explore</button>
+      </div>
+      <div class="speed-control">
+        <label for="speed-slider">Drive Speed Limit: <span id="speed-value">0.45</span></label>
+        <input type="range" id="speed-slider" min="0.10" max="1.00" step="0.05" value="0.45">
+      </div>
+      <div class="drive-pad">
+        <button data-drive="forward">▲</button>
+        <div><button data-drive="left">◀</button><button data-drive="stop">■</button><button data-drive="right">▶</button></div>
+        <button data-drive="backward">▼</button>
+        <div><button data-drive="spin-left">↶</button><button data-drive="spin-right">↷</button></div>
+      </div>
+      <button id="showcase" class="showcase">Run Mecanum Showcase</button>
+    </section>
+
+    <section class="panel conversation-panel">
+      <div class="panel-head"><h2>Companion Interaction</h2><span id="provider">LOCAL</span></div>
+      <div id="chat" class="chat"><p class="system">AURUS runtime initialized. Core behavior is offline-first.</p></div>
+      <div class="talk-row">
+        <input id="message" maxlength="1000" placeholder="Talk to AURUS…">
+        <button id="send">Send</button>
+        <button id="listen" class="mic">Push to Talk</button>
+      </div>
+      <div class="memory-row">
+        <input id="fact" maxlength="500" placeholder="Fact to remember about the recognized person">
+        <button id="remember">Remember</button>
+      </div>
+    </section>
+
+    <section class="panel health-panel">
+      <div class="panel-head"><h2>System Health</h2><span>graceful degradation</span></div>
+      <div id="health" class="health-grid"></div>
+      <p id="error" class="error"></p>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='vendor/socket.io.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/evaluation.js') }}"></script>
+</body>
+</html>
