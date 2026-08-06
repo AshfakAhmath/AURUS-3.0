@@ -66,8 +66,22 @@ class MecanumDriver:
         ]
 
         for pin in all_pins:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.LOW)
+            try:
+                GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            except Exception as exc:
+                try:
+                    GPIO.cleanup(pin)
+                    GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+                except Exception:
+                    print("\n" + "="*70)
+                    print("[AURUS HARDWARE ERROR] GPIO PINS ARE BUSY OR LOCKED BY ANOTHER PROCESS!")
+                    print("Why this happens: Another Python process (like 'aurus_mcp_server.py' from")
+                    print("your MCP test, or an unclosed run.py) is actively holding the motor pins.")
+                    print("On Raspberry Pi 4, Linux locks GPIO pins to only ONE running script at a time.")
+                    print("\nTO FIX INSTANTLY, RUN THIS COMMAND IN YOUR TERMINAL:")
+                    print("  sudo killall -9 python3 python")
+                    print("="*70 + "\n")
+                    raise exc
 
         # Initialize PWM at 100Hz
         self.pwm_channels['FL'] = GPIO.PWM(config.MOTOR_FL_ENA, 100)
@@ -80,15 +94,21 @@ class MecanumDriver:
 
     def _set_motor(self, in1, in2, pwm_ch, speed):
         # speed is from -1.0 to 1.0
-        duty = int(abs(speed) * 100)
-        duty = max(0, min(100, duty))
+        val = abs(speed)
+        if val > 0.01:
+            # L298N voltage drop + mecanum static friction causes motor stalls below ~85% PWM duty cycle.
+            # Remap active speed commands into the effective working motor range (85 to 100 PWM duty cycle)
+            duty = int(85 + (val * 15))
+            duty = max(85, min(100, duty))
+        else:
+            duty = 0
 
-        if speed > 0:
+        if speed > 0.01:
             if not self.is_simulation:
                 GPIO.output(in1, GPIO.HIGH)
                 GPIO.output(in2, GPIO.LOW)
                 self.pwm_channels[pwm_ch].ChangeDutyCycle(duty)
-        elif speed < 0:
+        elif speed < -0.01:
             if not self.is_simulation:
                 GPIO.output(in1, GPIO.LOW)
                 GPIO.output(in2, GPIO.HIGH)
@@ -122,8 +142,8 @@ class MecanumDriver:
             vy_scaled = vy * self.speed_multiplier
             omega_scaled = omega * self.speed_multiplier
 
-            # Adjust strafe direction using multiplier
-            vy_adjusted = vy_scaled * config.MOTOR_STRAFE_DIR
+            # Adjust strafe direction using multiplier and boost by 1.35x to overcome lateral roller friction
+            vy_adjusted = vy_scaled * config.MOTOR_STRAFE_DIR * 1.35
 
             # Kinematics formula
             v_fl = vx_scaled + vy_adjusted + omega_scaled

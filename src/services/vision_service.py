@@ -80,11 +80,26 @@ class VisionService:
             self._backend = "yunet+sface"
             return
 
-        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-        self._haar = cv2.CascadeClassifier(str(cascade_path))
-        if self._haar.empty():
-            raise RuntimeError("YuNet/SFace models and Haar fallback are unavailable")
-        self._backend = "haar-session-fallback"
+        cascade_paths = []
+        if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
+            cascade_paths.append(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
+        cascade_paths.extend([
+            self.model_dir / "haarcascade_frontalface_default.xml",
+            Path("/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml"),
+            Path("/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"),
+            Path("/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"),
+            Path("/usr/share/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"),
+        ])
+
+        for path in cascade_paths:
+            if path.exists():
+                self._haar = cv2.CascadeClassifier(str(path))
+                if not self._haar.empty():
+                    self._backend = "haar-session-fallback"
+                    return
+
+        print("[VisionService] Warning: No YuNet or Haar face detection models found. Running video stream in streaming-only mode.")
+        self._backend = "video-only-fallback"
 
     def _open_camera(self) -> None:
         if Picamera2 is not None and os.name != "nt":
@@ -94,27 +109,58 @@ class VisionService:
                     config = camera.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
                     camera.configure(config)
                 except Exception:
-                    # Fallback to default video configuration if RGB888 format is rejected by driver
-                    config = camera.create_video_configuration(main={"size": (640, 480)})
-                    camera.configure(config)
+                    try:
+                        config = camera.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+                        camera.configure(config)
+                    except Exception:
+                        config = camera.create_video_configuration(main={"size": (640, 480)})
+                        camera.configure(config)
                 camera.start()
                 time.sleep(0.5)
-                self._camera = camera
-                self._camera_kind = "picamera2"
-                return
+                rgb = camera.capture_array("main")
+                if rgb is not None and rgb.size > 0:
+                    self._camera = camera
+                    self._camera_kind = "picamera2"
+                    print("[VisionService] Raspberry Pi CSI camera connected via Picamera2.")
+                    return
+                else:
+                    camera.stop()
+                    camera.close()
+                    print("[VisionService] Picamera2 started but capture_array returned empty frame.")
             except Exception as exc:
-                print(f"[VisionService] Picamera2 failed: {exc}. Trying OpenCV fallback...")
+                print(f"[VisionService] Picamera2 failed: {exc}. Trying OpenCV Video4Linux fallback...")
+        elif os.name != "nt" and Picamera2 is None:
+            print("[VisionService] Note: python3-picamera2 library not found in current Python environment. If using a venv on Raspberry Pi, ensure it was created with --system-site-packages.")
 
         if cv2 is None:
             raise RuntimeError("No camera backend available")
-        camera = cv2.VideoCapture(self.camera_index)
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not camera.isOpened():
-            camera.release()
-            raise RuntimeError(f"could not open camera {self.camera_index}")
-        self._camera = camera
-        self._camera_kind = "opencv"
+
+        indices_to_try = []
+        for idx in [self.camera_index, 0, 1, 2, 3, 4]:
+            if idx not in indices_to_try:
+                indices_to_try.append(idx)
+
+        for idx in indices_to_try:
+            try:
+                camera = cv2.VideoCapture(idx)
+                if not camera.isOpened():
+                    camera.release()
+                    continue
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                time.sleep(0.2)
+                ok, frame = camera.read()
+                if ok and frame is not None and frame.size > 0:
+                    self._camera = camera
+                    self._camera_kind = "opencv"
+                    print(f"[VisionService] Connected to video camera at index {idx} ({frame.shape[1]}x{frame.shape[0]}).")
+                    return
+                else:
+                    camera.release()
+            except Exception:
+                pass
+
+        raise RuntimeError(f"Could not open camera stream (checked indices {indices_to_try}). Ensure ribbon cable is seated & sensor enabled.")
 
     def _close_camera(self) -> None:
         camera = self._camera
@@ -131,11 +177,18 @@ class VisionService:
             pass
 
     def _read_frame(self):
-        if self._camera_kind == "picamera2":
-            rgb = self._camera.capture_array("main")
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        ok, frame = self._camera.read()
-        return frame if ok else None
+        try:
+            if self._camera_kind == "picamera2":
+                rgb = self._camera.capture_array("main")
+                if rgb is None or rgb.size == 0:
+                    return None
+                if len(rgb.shape) == 3 and rgb.shape[2] == 4:
+                    return cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            ok, frame = self._camera.read()
+            return frame if (ok and frame is not None and frame.size > 0) else None
+        except Exception:
+            return None
 
     def _detect(self, frame):
         resized = cv2.resize(frame, (self.width, self.height))
@@ -147,7 +200,7 @@ class VisionService:
                 for face in faces:
                     x, y, w, h = [int(value) for value in face[:4]]
                     detections.append((x, y, w, h, float(face[-1]), face))
-        else:
+        elif self._haar is not None:
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
             faces = self._haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
             for x, y, w, h in faces:
@@ -217,32 +270,58 @@ class VisionService:
         return snapshot
 
     def _set_error(self, message: str) -> None:
+        if self._snapshot.error != message[:200]:
+            print(f"[VisionService Error] {message}")
+        jpeg_fallback = None
+        if cv2 is not None:
+            try:
+                canvas = np.zeros((240, 320, 3), dtype=np.uint8)
+                canvas[:] = (35, 35, 40)
+                cv2.putText(canvas, "CAMERA OFFLINE", (55, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (73, 159, 255), 2)
+                cv2.putText(canvas, "Reconnecting...", (95, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                short_msg = message.replace("Waiting for camera: ", "").strip()[:42]
+                cv2.putText(canvas, short_msg, (max(10, 160 - len(short_msg)*3), 165), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 140, 220), 1)
+                ok, encoded = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+                if ok:
+                    jpeg_fallback = encoded.tobytes()
+            except Exception:
+                pass
         with self._lock:
             self._snapshot = VisionSnapshot(
                 timestamp=time.monotonic(), healthy=False, backend=self._backend, error=message[:200]
             )
+            self._jpeg = jpeg_fallback
 
     def _run(self) -> None:
         try:
             self._configure_models()
-            self._open_camera()
         except Exception as exc:
-            self._set_error(str(exc))
-            self._close_camera()
+            self._set_error(f"Model configuration failed: {exc}")
             return
 
-        try:
-            while not self._stop.is_set():
-                started = time.monotonic()
-                frame = self._read_frame()
-                if frame is None:
-                    self._set_error("camera returned no frame")
-                    self._stop.wait(0.2)
-                    continue
+        while not self._stop.is_set():
+            started = time.monotonic()
+            if self._camera is None:
                 try:
-                    self.process_frame(frame)
+                    self._open_camera()
                 except Exception as exc:
-                    self._set_error(f"vision processing failed: {exc}")
-                self._stop.wait(max(0.0, self.period - (time.monotonic() - started)))
-        finally:
-            self._close_camera()
+                    self._set_error(f"Waiting for camera: {exc}")
+                    self._stop.wait(2.0)
+                    continue
+
+            frame = self._read_frame()
+            if frame is None:
+                self._set_error("Camera returned no frame; reconnecting...")
+                self._close_camera()
+                self._stop.wait(1.0)
+                continue
+
+            try:
+                self.process_frame(frame)
+            except Exception as exc:
+                self._set_error(f"Vision processing failed: {exc}")
+                self._stop.wait(0.2)
+                continue
+
+            self._stop.wait(max(0.0, self.period - (time.monotonic() - started)))
+        self._close_camera()

@@ -42,7 +42,7 @@ function renderTelemetry(data) {
 }
 
 function renderHealth(health) {
-  const keys = ['runtime','motors','sensors','camera','microphone','tts','database','cloud','wake_phrase','estop'];
+  const keys = ['runtime','motors','sensors','camera','microphone','tts','database','cloud','mcp_agent','wake_phrase','estop'];
   $('health').innerHTML = keys.map(key => {
     const value = Boolean(health[key]);
     const expectedBad = key === 'estop';
@@ -110,7 +110,14 @@ function sendText() {
   socket.emit('send_text', {text});
   $('message').value = '';
 }
+function sendAgentCmd() {
+  const text = $('message').value.trim();
+  if (!text) return;
+  socket.emit('run_mcp_agent', {text});
+  $('message').value = '';
+}
 $('send').onclick = sendText;
+if ($('agent-cmd')) $('agent-cmd').onclick = sendAgentCmd;
 $('message').addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
 $('listen').onclick = () => socket.emit('start_listening', {});
 $('estop').onclick = () => socket.emit('stop', {});
@@ -120,7 +127,7 @@ $('enroll').onclick = () => socket.emit('enroll_person', {name: $('enroll-name')
 $('remember').onclick = () => socket.emit('remember_fact', {text: $('fact').value.trim()});
 document.querySelectorAll('[data-mode]').forEach(btn => btn.onclick = () => socket.emit('set_mode', {mode: btn.dataset.mode}));
 
-let currentSpeed = 0.45;
+let currentSpeed = 1.0;
 const speedSlider = $('speed-slider');
 const speedValue = $('speed-value');
 

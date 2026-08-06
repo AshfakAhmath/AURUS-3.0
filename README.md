@@ -13,6 +13,7 @@ The existing verified motor directions, GPIO pin assignments, ultrasonic wiring,
 - Recognize commands locally with Vosk and speak with Piper/eSpeak.
 - Use Groq only for optional open-ended conversation; robot control remains deterministic.
 - Show live camera, radar, identity, health, and requested-versus-final motion in a local dashboard.
+- **NEW**: Run a live, autonomous **Groq MCP Agent** directly inside the dashboard to execute complex commands (like navigation, sensing, and speaking) using lightning-fast AI tool calling.
 
 ## Quick start on Raspberry Pi
 

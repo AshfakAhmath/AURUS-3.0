@@ -45,8 +45,22 @@ class ProximitySensor:
         ]
 
         for trig, echo in sensor_pins:
-            GPIO.setup(trig, GPIO.OUT)
-            GPIO.setup(echo, GPIO.IN)
+            try:
+                GPIO.setup(trig, GPIO.OUT, initial=GPIO.LOW)
+                GPIO.setup(echo, GPIO.IN)
+            except Exception as exc:
+                try:
+                    GPIO.cleanup([trig, echo])
+                    GPIO.setup(trig, GPIO.OUT, initial=GPIO.LOW)
+                    GPIO.setup(echo, GPIO.IN)
+                except Exception:
+                    print("\n" + "="*70)
+                    print("[AURUS HARDWARE ERROR] SENSOR GPIO PINS ARE BUSY OR LOCKED!")
+                    print("Another Python process is holding the ultrasonic sensor pins.")
+                    print("\nTO FIX INSTANTLY, RUN THIS COMMAND IN YOUR TERMINAL:")
+                    print("  sudo killall -9 python3 python")
+                    print("="*70 + "\n")
+                    raise exc
 
     def _read_physical_sensor(self, trig_pin, echo_pin):
         """Read distance from a physical HC-SR04 sensor. Returns distance in cm."""

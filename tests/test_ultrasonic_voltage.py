@@ -15,8 +15,7 @@ def main():
     
     # We only need to control the Trigger pin.
     # The Echo pin is left disconnected from the Pi during this test.
-    GPIO.setup(TRIG_PIN, GPIO.OUT)
-    GPIO.output(TRIG_PIN, GPIO.LOW)
+    GPIO.setup(TRIG_PIN, GPIO.OUT, initial=GPIO.LOW)
     
     print("=========================================================")
     print("          ULTRASONIC SENSOR VOLTAGE TEST SCRIPT          ")

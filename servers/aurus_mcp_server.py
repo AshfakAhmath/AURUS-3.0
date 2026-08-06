@@ -110,7 +110,7 @@ mcp = FastMCP(
 @mcp.tool()
 def move_rover(
     direction: str,
-    speed: float = 0.4,
+    speed: float = 1.0,
     duration: float = 1.0,
 ) -> str:
     """Move AURUS in a direction for a given duration, then stop.
@@ -119,7 +119,7 @@ def move_rover(
         direction: One of 'forward', 'backward', 'left', 'right',
                    'forward_left', 'forward_right', 'backward_left',
                    'backward_right'.
-        speed: Speed from 0.0 to 1.0 (default 0.4 — safe for indoors).
+        speed: Speed from 0.0 to 1.0 (default 1.0 — maximum torque for mecanum wheels).
         duration: Seconds to drive (default 1.0).
 
     Returns:
@@ -153,31 +153,35 @@ def move_rover(
     _driver.stop()
 
     state = _driver.get_simulation_state()
-    return json.dumps({
+    res = {
         "status": "ok",
         "direction": direction,
         "speed": speed,
         "duration_s": duration,
         "simulation_mode": _driver.is_simulation,
+        "message": f"Moved {direction} for {duration}s at {int(speed*100)}% power." + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
         "position": {
             "x_cm": round(state["x"], 1),
             "y_cm": round(state["y"], 1),
             "heading_deg": round(state["theta"] * 57.2958, 1),
         },
-    })
+    }
+    if _driver.is_simulation:
+        res["warning"] = "Running in PC/Simulation mode. If running on Pi, check RPi.GPIO installation and pin permissions."
+    return json.dumps(res)
 
 
 @mcp.tool()
 def spin_rover(
     direction: str = "left",
-    speed: float = 0.5,
+    speed: float = 1.0,
     duration: float = 1.0,
 ) -> str:
     """Spin AURUS in place (rotate without translating).
 
     Args:
         direction: 'left' or 'right'.
-        speed: Rotation speed from 0.0 to 1.0.
+        speed: Rotation speed from 0.0 to 1.0 (default 1.0 — maximum torque for mecanum wheels).
         duration: Seconds to spin.
     """
     _init_hardware()
@@ -190,12 +194,17 @@ def spin_rover(
     _driver.stop()
 
     state = _driver.get_simulation_state()
-    return json.dumps({
+    res = {
         "status": "ok",
         "spin_direction": direction,
         "duration_s": duration,
+        "simulation_mode": _driver.is_simulation,
+        "message": f"Spun {direction} for {duration}s at {int(speed*100)}% power." + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
         "heading_deg": round(state["theta"] * 57.2958, 1),
-    })
+    }
+    if _driver.is_simulation:
+        res["warning"] = "Running in PC/Simulation mode. If running on Pi, check RPi.GPIO installation and pin permissions."
+    return json.dumps(res)
 
 
 @mcp.tool()

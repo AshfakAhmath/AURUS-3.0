@@ -39,6 +39,27 @@
       <p id="enroll-label" class="muted">Enrollment idle</p>
     </section>
 
+    <section class="panel controls-panel">
+      <div class="panel-head"><h2>Behavior</h2><span>deterministic control</span></div>
+      <div class="mode-grid">
+        <button data-mode="idle">Idle</button>
+        <button data-mode="manual">Manual</button>
+        <button data-mode="following">Follow</button>
+        <button data-mode="exploring">Explore</button>
+      </div>
+      <div class="speed-control">
+        <label for="speed-slider">Drive Speed Limit: <span id="speed-value">1.00</span></label>
+        <input type="range" id="speed-slider" min="0.20" max="1.00" step="0.05" value="1.0">
+      </div>
+      <div class="drive-pad">
+        <button data-drive="forward">▲</button>
+        <div><button data-drive="left">◀</button><button data-drive="stop">■</button><button data-drive="right">▶</button></div>
+        <button data-drive="backward">▼</button>
+        <div><button data-drive="spin-left">↶</button><button data-drive="spin-right">↷</button></div>
+      </div>
+      <button id="showcase" class="showcase">Run Mecanum Showcase</button>
+    </section>
+
     <section class="panel awareness-panel">
       <div class="panel-head"><h2>Spatial Awareness</h2><span id="sensor-age">—</span></div>
       <canvas id="radar" width="520" height="320"></canvas>
@@ -56,33 +77,13 @@
       </div>
     </section>
 
-    <section class="panel controls-panel">
-      <div class="panel-head"><h2>Behavior</h2><span>deterministic control</span></div>
-      <div class="mode-grid">
-        <button data-mode="idle">Idle</button>
-        <button data-mode="manual">Manual</button>
-        <button data-mode="following">Follow</button>
-        <button data-mode="exploring">Explore</button>
-      </div>
-      <div class="speed-control">
-        <label for="speed-slider">Drive Speed Limit: <span id="speed-value">0.45</span></label>
-        <input type="range" id="speed-slider" min="0.10" max="1.00" step="0.05" value="0.45">
-      </div>
-      <div class="drive-pad">
-        <button data-drive="forward">▲</button>
-        <div><button data-drive="left">◀</button><button data-drive="stop">■</button><button data-drive="right">▶</button></div>
-        <button data-drive="backward">▼</button>
-        <div><button data-drive="spin-left">↶</button><button data-drive="spin-right">↷</button></div>
-      </div>
-      <button id="showcase" class="showcase">Run Mecanum Showcase</button>
-    </section>
-
     <section class="panel conversation-panel">
       <div class="panel-head"><h2>Companion Interaction</h2><span id="provider">LOCAL</span></div>
       <div id="chat" class="chat"><p class="system">AURUS runtime initialized. Core behavior is offline-first.</p></div>
       <div class="talk-row">
-        <input id="message" maxlength="1000" placeholder="Talk to AURUS…">
+        <input id="message" maxlength="1000" placeholder="Talk to AURUS or give MCP Agent command…">
         <button id="send">Send</button>
+        <button id="agent-cmd" class="agent-btn" title="Execute command using Groq MCP tool-calling agent">⚡ MCP Agent</button>
         <button id="listen" class="mic">Push to Talk</button>
       </div>
       <div class="memory-row">

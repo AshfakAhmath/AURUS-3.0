@@ -22,6 +22,7 @@ from src.services.speech_service import SpeechService
 from src.services.tts_service import TTSService
 from src import config
 from src.services.vision_service import VisionService
+from src.services.mcp_agent_service import MCPAgentService
 
 
 class RobotRuntime:
@@ -58,6 +59,7 @@ class RobotRuntime:
         self.behavior = BehaviorController(
             self.arbiter, self.sensor_sampler, self.vision, self._handle_behavior_event
         )
+        self.mcp_agent = MCPAgentService(self)
         self._event_sink: Callable[[str, dict], None] = lambda event, payload: None
         self._started = False
         self._lock = threading.RLock()
@@ -143,7 +145,7 @@ class RobotRuntime:
         snapshot = self.vision.get_snapshot()
         if snapshot.backend == "yunet+sface":
             status = self.identity.begin_enrollment(name)
-        elif snapshot.backend == "haar-session-fallback":
+        elif snapshot.backend in ("haar-session-fallback", "video-only-fallback"):
             status = self.identity.begin_session_identity(name)
         else:
             raise ValueError("Vision is not ready for enrollment yet.")
@@ -307,6 +309,7 @@ class RobotRuntime:
             "database": True,
             "cloud": self.conversation.configured,
             "cloud_error": self.conversation.last_error,
+            "mcp_agent": self.mcp_agent.ready,
             "estop": self.arbiter.estopped,
         }
 

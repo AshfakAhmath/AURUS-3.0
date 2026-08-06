@@ -106,6 +106,12 @@ def create_app(runtime):
         if text:
             socketio.start_background_task(runtime.handle_text, text, "text")
 
+    @socketio.on("run_mcp_agent")
+    def run_mcp_agent(data):
+        command = str((data or {}).get("text", "")).strip()
+        if command:
+            socketio.start_background_task(runtime.mcp_agent.execute_command, command)
+
     @socketio.on("enroll_person")
     def enroll_person(data):
         name = str((data or {}).get("name", "")).strip()
