@@ -37,24 +37,59 @@ class RobotRuntime:
         self.vision = VisionService(self.identity, self.project_root / "models")
 
         microphone_index = os.getenv("MIC_INDEX")
-        microphone_index_value = (
-            int(microphone_index)
-            if microphone_index and microphone_index.strip().lower() not in ("none", "null")
-            else None
+        try:
+            microphone_index_value = (
+                int(microphone_index)
+                if microphone_index and microphone_index.strip().lower() not in ("none", "null")
+                else None
+            )
+        except ValueError:
+            microphone_index_value = None
+
+        def model_path(variable: str, default: Path) -> Path:
+            raw = os.getenv(variable, "").strip()
+            configured = Path(raw) if raw else default
+            return configured if configured.is_absolute() else self.project_root / configured
+
+        def float_setting(variable: str, default: float) -> float:
+            try:
+                return float(os.getenv(variable, str(default)))
+            except ValueError:
+                return default
+
+        audio_playback = threading.Event()
+        keyword_model = model_path(
+            "KWS_MODEL_PATH",
+            Path("models") / "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
         )
         self.speech = SpeechService(
-            model_path=os.getenv(
-                "VOSK_MODEL_PATH", str(self.project_root / "models" / "vosk-model-en-us-0.22")
+            model_path=model_path(
+                "VOSK_MODEL_PATH", Path("models") / "vosk-model-small-en-us-0.15"
             ),
+            keyword_model_path=keyword_model,
+            keywords_path=model_path("KWS_KEYWORDS_PATH", keyword_model / "aurus_keywords.txt"),
+            vad_model_path=model_path("VAD_MODEL_PATH", Path("models") / "silero_vad.onnx"),
             microphone_index=microphone_index_value,
             record_seconds=config.AURUS_RECORD_SECONDS,
+            speech_start_timeout=float_setting("AURUS_SPEECH_START_TIMEOUT", 4.0),
             wake_enabled=os.getenv("AURUS_WAKE_ENABLED", "false").lower() == "true",
-            wake_test_passes=int(os.getenv("WAKE_TEST_PASSES", "0")),
-            wake_test_total=int(os.getenv("WAKE_TEST_TOTAL", "0")),
+            playback_active=audio_playback,
         )
-        self.tts = TTSService(os.getenv("PIPER_MODEL_PATH"))
+        self.tts = TTSService(
+            model_path("PIPER_MODEL_PATH", Path("models") / "en_US-lessac-medium.onnx"),
+            playback_active=audio_playback,
+        )
         self.conversation = ConversationService(
-            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), timeout=4.0
+            model_path=model_path(
+                "LOCAL_LLM_MODEL_PATH",
+                Path("models") / "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            ),
+            server_url=os.getenv("LOCAL_LLM_SERVER_URL", ""),
+            model=os.getenv("LOCAL_LLM_MODEL", "qwen2.5-1.5b-instruct"),
+            timeout=float_setting("LOCAL_LLM_TIMEOUT", 20.0),
+            context_size=int(float_setting("LOCAL_LLM_CONTEXT", 2048)),
+            max_tokens=int(float_setting("LOCAL_LLM_MAX_TOKENS", 96)),
+            threads=int(float_setting("LOCAL_LLM_THREADS", min(4, os.cpu_count() or 2))),
         )
         self.behavior = BehaviorController(
             self.arbiter, self.sensor_sampler, self.vision, self._handle_behavior_event
@@ -79,29 +114,49 @@ class RobotRuntime:
             if self._started:
                 return
             self._started = True
-        self.sensor_sampler.sample_once()
-        self.sensor_sampler.start()
-        self.arbiter.start()
-        self.vision.start()
-        self.tts.start()
-        self.speech.start(lambda text: self.handle_text(text, source="wake"))
-        self.behavior.start()
-        self.repository.log_event("runtime", "AURUS evaluation runtime started")
+        try:
+            self.sensor_sampler.sample_once()
+            self.sensor_sampler.start()
+            self.arbiter.start()
+            self.vision.start()
+            self.tts.start()
+            self.speech.start(lambda text: self.handle_text(text, source="wake"))
+            self.behavior.start()
+            self.conversation.start()
+            self.repository.log_event("runtime", "AURUS evaluation runtime started")
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         with self._lock:
             if not self._started:
                 return
             self._started = False
-        self.arbiter.emergency_stop("runtime shutdown")
-        self.behavior.stop()
-        self.speech.stop()
-        self.vision.stop()
-        self.arbiter.stop()
-        self.sensor_sampler.stop()
-        self.tts.stop()
-        self.driver.cleanup()
-        self.repository.log_event("runtime", "AURUS evaluation runtime stopped")
+        errors = []
+        shutdown_steps = (
+            ("emergency stop", lambda: self.arbiter.emergency_stop("runtime shutdown")),
+            ("behavior", self.behavior.stop),
+            ("speech", self.speech.stop),
+            ("local LLM", self.conversation.stop),
+            ("vision", self.vision.stop),
+            ("arbiter", self.arbiter.stop),
+            ("sensor sampler", self.sensor_sampler.stop),
+            ("tts", self.tts.stop),
+            ("motor driver", self.driver.cleanup),
+        )
+        for component, action in shutdown_steps:
+            try:
+                action()
+            except Exception as exc:
+                errors.append(f"{component}: {str(exc)[:120]}")
+        description = "AURUS evaluation runtime stopped"
+        if errors:
+            description += "; shutdown warnings: " + " | ".join(errors)
+        try:
+            self.repository.log_event("runtime", description)
+        except Exception:
+            pass
 
     def dashboard_connected(self, connected: bool) -> None:
         if connected:
@@ -163,7 +218,15 @@ class RobotRuntime:
         if not self.speech.healthy:
             self.emit("conversation", {"source": "voice", "transcript": "", "response": "Microphone recognition is unavailable. Please use text input.", "provider": "local", "fallback_reason": self.speech.error})
             return False
-        self.arbiter.set_mode(RobotMode.LISTENING)
+        if not self.arbiter.set_mode(RobotMode.LISTENING):
+            self.emit("conversation", {
+                "source": "voice",
+                "transcript": "",
+                "response": "Listening is unavailable while the emergency stop is latched.",
+                "provider": "local",
+                "fallback_reason": "emergency stop latched",
+            })
+            return False
         started = self.speech.listen_once(self._speech_result)
         if not started:
             self.arbiter.set_mode(RobotMode.IDLE)
@@ -176,6 +239,8 @@ class RobotRuntime:
             self.arbiter.set_mode(RobotMode.IDLE)
             return
         self.handle_text(text, source="voice")
+        if self.arbiter.mode == RobotMode.LISTENING:
+            self.arbiter.set_mode(RobotMode.IDLE)
 
     def _current_person(self):
         identity = self.vision.get_snapshot().identity
@@ -214,12 +279,12 @@ class RobotRuntime:
             return self._announce("I did not receive a command.", source, clean, "local")
         lower = clean.lower()
 
-        if any(phrase in lower for phrase in ("emergency stop", "e stop", "estop")):
-            self.emergency_stop()
-            return self._announce("Emergency stop activated and latched.", source, clean, "local")
-        if "clear emergency" in lower or "clear estop" in lower:
+        if re.search(r"\bclear(?:\s+the)?\s+(?:emergency\s+stop|e[\s-]?stop)\b", lower):
             self.clear_estop()
             return self._announce("Emergency stop cleared. I am idle.", source, clean, "local")
+        if "emergency stop" in lower or re.search(r"\be[\s-]?stop\b", lower):
+            self.emergency_stop()
+            return self._announce("Emergency stop activated and latched.", source, clean, "local")
         if lower in ("stop", "halt", "freeze") or "stop following" in lower or "stop exploring" in lower:
             self.arbiter.halt("voice-stop")
             if not self.arbiter.estopped:
@@ -237,12 +302,7 @@ class RobotRuntime:
             )
             return self._announce(response, source, clean, "local")
 
-        remember_match = re.search(r"(?:remember that|remember)\s+(.+)", clean, re.IGNORECASE)
-        if remember_match:
-            ok, response = self.remember_fact(remember_match.group(1).strip())
-            return self._announce(response, source, clean, "local", "" if ok else "identity required")
-
-        if any(phrase in lower for phrase in ("what do you remember", "what do you know about me", "remember about me")):
+        if any(phrase in lower for phrase in ("what do you remember", "what do you know about me", "remember about me", "do you remember me")):
             person = self._current_person()
             if person.user_id is None:
                 return self._announce("I do not know who you are yet. Please tell me your name.", source, clean, "local")
@@ -252,6 +312,11 @@ class RobotRuntime:
             else:
                 response = f"I recognize you as {person.name}, but you have not taught me a fact yet."
             return self._announce(response, source, clean, "local")
+
+        remember_match = re.search(r"(?:remember that|remember)\s+(.+)", clean, re.IGNORECASE)
+        if remember_match:
+            ok, response = self.remember_fact(remember_match.group(1).strip())
+            return self._announce(response, source, clean, "local", "" if ok else "identity required")
 
         if "follow me" in lower or lower == "follow":
             if self.arbiter.set_mode(RobotMode.FOLLOWING):
@@ -302,13 +367,25 @@ class RobotRuntime:
             "camera": vision.healthy,
             "vision_backend": vision.backend,
             "microphone": self.speech.healthy,
+            "microphone_error": self.speech.error,
+            "stt_backend": self.speech.stt_backend,
+            "vad_backend": self.speech.vad_backend,
+            "vad_error": self.speech.vad_error,
             "wake_phrase": self.speech.wake_active,
+            "wake_backend": self.speech.wake_backend,
+            "wake_error": self.speech.wake_error,
             "wake_gate_passed": self.speech.wake_gate_passed,
             "tts": self.tts.healthy,
             "tts_backend": self.tts.backend,
+            "tts_error": self.tts.error,
+            "audio_playback": self.tts.playback_active.is_set(),
             "database": True,
-            "cloud": self.conversation.configured,
-            "cloud_error": self.conversation.last_error,
+            "llm": self.conversation.ready,
+            "llm_loading": self.conversation.loading,
+            "llm_backend": self.conversation.backend,
+            "llm_error": self.conversation.last_error,
+            "cloud": False,
+            "cloud_error": "local LLM selected for dialogue",
             "mcp_agent": self.mcp_agent.ready,
             "estop": self.arbiter.estopped,
         }

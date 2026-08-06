@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 from typing import Any
+
+from src.core.models import RobotMode
 
 try:
     from groq import Groq
@@ -20,7 +23,7 @@ AURUS_MCP_TOOLS = [
         "type": "function",
         "function": {
             "name": "move_rover",
-            "description": "Move AURUS in a direction for a given duration, then stop.",
+            "description": "Move AURUS in a linear direction (translating/strafing). Do NOT use this for turning or spinning.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -36,7 +39,7 @@ AURUS_MCP_TOOLS = [
                             "backward_left",
                             "backward_right",
                         ],
-                        "description": "Direction to drive.",
+                        "description": "Direction to drive. 'left' means strafe left sideways.",
                     },
                     "speed": {
                         "type": "number",
@@ -57,7 +60,7 @@ AURUS_MCP_TOOLS = [
         "type": "function",
         "function": {
             "name": "spin_rover",
-            "description": "Spin AURUS in place (rotate without translating).",
+            "description": "Spin or turn AURUS in place (rotate). Use this whenever the user asks to 'turn left' or 'turn right'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -178,6 +181,7 @@ class MCPAgentService:
         # Llama 3.3 70B Versatile is currently Groq's best tool-calling model
         self.model = model or os.getenv("GROQ_AGENT_MODEL", "llama-3.3-70b-versatile")
         self._client = None
+        self._execution_lock = threading.Lock()
         if self.api_key and Groq is not None:
             try:
                 self._client = Groq(api_key=self.api_key, timeout=15.0, max_retries=1)
@@ -189,6 +193,25 @@ class MCPAgentService:
         return self._client is not None
 
     def execute_command(self, user_command: str) -> dict:
+        if not self._execution_lock.acquire(blocking=False):
+            msg = "The MCP Agent is already executing a command. Stop it or wait for it to finish."
+            self.runtime.emit(
+                "conversation",
+                {
+                    "source": "agent",
+                    "transcript": user_command,
+                    "response": msg,
+                    "provider": "local",
+                    "fallback_reason": "agent busy",
+                },
+            )
+            return {"status": "error", "message": msg}
+        try:
+            return self._execute_command(user_command)
+        finally:
+            self._execution_lock.release()
+
+    def _execute_command(self, user_command: str) -> dict:
         """Executes a natural language instructions using Groq tool calling loop."""
         if not self._client:
             msg = "⚡ Groq MCP Agent is unavailable. Please check that 'groq' is installed and GROQ_API_KEY is set in your .env file."
@@ -220,7 +243,9 @@ class MCPAgentService:
             "You are the autonomous cloud AI brain controlling AURUS, a 4-wheel mecanum rover with "
             "5 ultrasonic sensors, a camera, text-to-speech, and persistent SQLite memory. "
             "When given a goal, invoke the appropriate tools to accomplish it safely. "
-            "Always check sensors if safety or obstacles are mentioned. Keep verbal speech concise and warm."
+            "Always check sensors if safety or obstacles are mentioned. Keep verbal speech concise and warm. "
+            "IMPORTANT: Always use native JSON tool calls. NEVER output raw <function> tags in your response text. "
+            "If the user just says 'hi', use the speak_text tool to greet them."
         )
 
         messages = [
@@ -231,6 +256,7 @@ class MCPAgentService:
         iterations = 0
         max_iterations = 6
         final_summary = ""
+
 
         try:
             while iterations < max_iterations:
@@ -257,9 +283,13 @@ class MCPAgentService:
                     fn_name = tool_call.function.name
                     raw_args = tool_call.function.arguments
                     try:
-                        args = json.loads(raw_args) if raw_args else {}
+                        args = __import__('json').loads(raw_args) if raw_args else {}
                     except Exception:
                         args = {}
+
+                    # Format arguments beautifully
+                    args_str = ", ".join(f"{k}='{v}'" if isinstance(v, str) else f"{k}={v}" for k, v in args.items())
+                    display_args = f" with {args_str}" if args_str else ""
 
                     # Notify dashboard of live tool call
                     self.runtime.emit(
@@ -276,7 +306,7 @@ class MCPAgentService:
                         {
                             "source": "tool",
                             "transcript": "",
-                            "response": f"⚡ Calling tool: {fn_name}({json.dumps(args)})",
+                            "response": f"⚡ Running action: {fn_name}{display_args}",
                             "provider": "mcp-tool",
                             "fallback_reason": "",
                         },
@@ -285,13 +315,35 @@ class MCPAgentService:
                     # Execute tool against live runtime
                     result_json = self._dispatch_tool(fn_name, args)
 
+                    # Parse result for clean UI
+                    try:
+                        res_dict = __import__('json').loads(result_json)
+                        if "message" in res_dict:
+                            res_str = res_dict["message"]
+                        elif "action" in res_dict:
+                            res_str = res_dict["action"]
+                        elif "distances_cm" in res_dict:
+                            res_str = f"Front clear: {res_dict.get('front_clear', False)}, Front closest: {res_dict.get('front_min_cm', 0)}cm"
+                        elif "detected_person" in res_dict:
+                            name = res_dict["detected_person"].get("name", "Unknown")
+                            res_str = f"Seen: {name}"
+                        elif "memories" in res_dict:
+                            res_str = f"Found {res_dict.get('count', 0)} memories."
+                        elif "health" in res_dict:
+                            mode = res_dict.get("mode", "unknown")
+                            res_str = f"Robot is in {mode} mode."
+                        else:
+                            res_str = "Success" if res_dict.get("status") == "ok" else "Error occurred"
+                    except Exception:
+                        res_str = "Finished execution."
+
                     self.runtime.emit(
                         "mcp_tool_exec",
                         {
                             "id": tool_call.id,
                             "tool": fn_name,
                             "arguments": args,
-                            "result": json.loads(result_json) if result_json.startswith("{") else result_json,
+                            "result": __import__('json').loads(result_json) if result_json.startswith("{") else result_json,
                             "status": "completed",
                         },
                     )
@@ -300,7 +352,7 @@ class MCPAgentService:
                         {
                             "source": "tool_res",
                             "transcript": "",
-                            "response": f"➔ {fn_name} returned: {result_json[:150]}",
+                            "response": f"➔ Result: {res_str}",
                             "provider": "mcp-res",
                             "fallback_reason": "",
                         },
@@ -331,18 +383,66 @@ class MCPAgentService:
             return {"status": "ok", "summary": final_summary, "turns": iterations}
 
         except Exception as exc:
-            err_msg = f"Groq Agent execution error: {str(exc)[:250]}"
+                print(f"[MCPAgentService] Initialization warning: {exc}")
+
+    @property
+    def ready(self) -> bool:
+        return self._client is not None
+
+    def execute_command(self, user_command: str) -> dict:
+        if not self._execution_lock.acquire(blocking=False):
+            msg = "The MCP Agent is already executing a command. Stop it or wait for it to finish."
             self.runtime.emit(
                 "conversation",
                 {
-                    "source": "error",
-                    "transcript": "",
-                    "response": err_msg,
-                    "provider": "groq-mcp",
-                    "fallback_reason": "exception",
+                    "source": "agent",
+                    "transcript": user_command,
+                    "response": msg,
+                    "provider": "local",
+                    "fallback_reason": "agent busy",
                 },
             )
-            return {"status": "error", "message": err_msg}
+            return {"status": "error", "message": msg}
+        try:
+            return self._execute_command(user_command)
+        finally:
+            self._execution_lock.release()
+
+    def _execute_motion_sequence(
+        self,
+        steps: list[tuple[float, float, float, float]],
+    ) -> tuple[bool, str]:
+        """Run an existing MCP motion through the same arbiter as every other behavior."""
+        if not steps:
+            return False, "empty motion sequence"
+        if not self.runtime.arbiter.set_mode(RobotMode.PERFORMING):
+            return False, "emergency stop is latched"
+
+        source = "mcp-agent"
+        try:
+            for vx, vy, omega, duration in steps:
+                deadline = time.monotonic() + max(0.05, duration)
+                while time.monotonic() < deadline:
+                    if self.runtime.arbiter.estopped:
+                        return False, "emergency stop is latched"
+                    if self.runtime.arbiter.mode != RobotMode.PERFORMING:
+                        return False, "motion was interrupted by a mode change"
+                    if not self.runtime.arbiter.command(
+                        source, vx, vy, omega, ttl=0.2, priority=60
+                    ):
+                        return False, "motion command was rejected"
+                    time.sleep(min(0.08, max(0.0, deadline - time.monotonic())))
+                    decision = self.runtime.arbiter.get_decision()
+                    if decision.requested.source == source and not decision.allowed:
+                        return False, decision.reason
+            return True, "completed"
+        finally:
+            self.runtime.arbiter.halt("mcp-agent-stop")
+            if (
+                not self.runtime.arbiter.estopped
+                and self.runtime.arbiter.mode == RobotMode.PERFORMING
+            ):
+                self.runtime.arbiter.set_mode(RobotMode.IDLE)
 
     def _dispatch_tool(self, name: str, args: dict) -> str:
         """Execute the requested MCP tool using the active robot runtime."""
@@ -364,15 +464,21 @@ class MCPAgentService:
                     "backward_left": (-speed, speed, 0.0),
                     "backward_right": (-speed, -speed, 0.0),
                 }
-                vels = direction_map.get(direction.lower(), (speed, 0.0, 0.0))
-                self.runtime.arbiter.command("mcp-agent", vels[0], vels[1], vels[2], ttl=duration, priority=60)
-                time.sleep(duration)
-                self.runtime.arbiter.halt("mcp-agent-stop")
+                vels = direction_map.get(direction.lower().replace(" ", "_"))
+                if vels is None:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Unknown movement direction: {direction}",
+                    })
+                completed, reason = self._execute_motion_sequence(
+                    [(vels[0], vels[1], vels[2], duration)]
+                )
                 state = self.runtime.driver.get_simulation_state()
                 return json.dumps(
                     {
-                        "status": "ok",
-                        "action": f"Moved {direction} for {duration}s",
+                        "status": "ok" if completed else "blocked",
+                        "action": f"Moved {direction} for {duration}s" if completed else "Movement stopped",
+                        "reason": reason,
                         "simulation_mode": self.runtime.driver.is_simulation,
                         "position": {
                             "x_cm": round(state.get("x", 0.0), 1),
@@ -383,16 +489,25 @@ class MCPAgentService:
 
             elif name == "spin_rover":
                 direction = str(args.get("direction", "left"))
-                speed = float(args.get("speed", 1.0))
-                duration = float(args.get("duration", 1.0))
+                if direction.lower() not in ("left", "right"):
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Unknown spin direction: {direction}",
+                    })
+                speed = max(0.0, min(1.0, float(args.get("speed", 1.0))))
+                duration = max(0.1, min(10.0, float(args.get("duration", 1.0))))
                 omega = speed if direction.lower() == "left" else -speed
-                self.runtime.arbiter.command("mcp-agent", 0.0, 0.0, omega, ttl=duration, priority=60)
-                time.sleep(duration)
-                self.runtime.arbiter.halt("mcp-agent-stop")
-                return json.dumps({"status": "ok", "action": f"Spun {direction} for {duration}s"})
+                completed, reason = self._execute_motion_sequence([(0.0, 0.0, omega, duration)])
+                return json.dumps({
+                    "status": "ok" if completed else "blocked",
+                    "action": f"Spun {direction} for {duration}s" if completed else "Spin stopped",
+                    "reason": reason,
+                })
 
             elif name == "stop_rover":
                 self.runtime.arbiter.halt("mcp-agent")
+                if not self.runtime.arbiter.estopped:
+                    self.runtime.arbiter.set_mode(RobotMode.IDLE)
                 return json.dumps({"status": "ok", "message": "All motors stopped."})
 
             elif name == "read_sensors":
@@ -437,11 +552,21 @@ class MCPAgentService:
             elif name == "remember_fact":
                 fact = str(args.get("fact", ""))
                 user_id = int(args.get("user_id", 1))
+                if self.runtime.repository.get_user(user_id) is None:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Unknown user_id {user_id}; enroll or recognize a person first.",
+                    })
                 self.runtime.repository.remember(user_id, fact)
                 return json.dumps({"status": "ok", "message": f"Remembered: {fact}"})
 
             elif name == "recall_memories":
                 user_id = int(args.get("user_id", 1))
+                if self.runtime.repository.get_user(user_id) is None:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Unknown user_id {user_id}; enroll or recognize a person first.",
+                    })
                 facts = self.runtime.repository.memories_for(user_id)
                 return json.dumps({"status": "ok", "count": len(facts), "memories": facts[:10]})
 
@@ -464,17 +589,20 @@ class MCPAgentService:
 
             elif name == "perform_animation":
                 anim = str(args.get("name", "wiggle")).lower()
-                animations = {
-                    "wiggle": lambda: self.runtime.driver.wiggle(duration=1.5),
-                    "shiver": lambda: self.runtime.driver.shiver(duration=1.2),
-                    "spin": lambda: self.runtime.driver.spin(duration=1.5),
+                animations: dict[str, list[tuple[float, float, float, float]]] = {
+                    "wiggle": [(0.0, direction * 0.6, 0.0, 0.15) for _ in range(5) for direction in (1, -1)],
+                    "shiver": [(direction * 0.4, 0.0, 0.0, 0.05) for _ in range(12) for direction in (1, -1)],
+                    "spin": [(0.0, 0.0, 0.6, 1.5)],
                 }
-                func = animations.get(anim)
-                if func:
-                    func()
-                    time.sleep(1.8)
-                    return json.dumps({"status": "ok", "animation": anim})
-                return json.dumps({"status": "error", "message": f"Unknown animation: {anim}"})
+                sequence = animations.get(anim)
+                if sequence is None:
+                    return json.dumps({"status": "error", "message": f"Unknown animation: {anim}"})
+                completed, reason = self._execute_motion_sequence(sequence)
+                return json.dumps({
+                    "status": "ok" if completed else "blocked",
+                    "animation": anim,
+                    "reason": reason,
+                })
 
             else:
                 return json.dumps({"status": "error", "message": f"Unknown tool name: {name}"})

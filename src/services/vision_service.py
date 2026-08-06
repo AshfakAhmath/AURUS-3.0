@@ -28,7 +28,7 @@ class VisionService:
         identity_service,
         model_dir: str | Path,
         camera_index: int = 0,
-        process_size: tuple[int, int] = (320, 240),
+        process_size: tuple[int, int] = (320, 256),
         rate_hz: float = 10.0,
     ):
         self.identity_service = identity_service
@@ -47,6 +47,7 @@ class VisionService:
         self._snapshot = VisionSnapshot()
         self._jpeg: bytes | None = None
         self._backend = "unavailable"
+        self._dnn_fallback_reported = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -80,6 +81,16 @@ class VisionService:
             self._backend = "yunet+sface"
             return
 
+        if self._configure_haar():
+            return
+
+        print("[VisionService] Warning: No YuNet or Haar face detection models found. Running video stream in streaming-only mode.")
+        self._backend = "video-only-fallback"
+
+    def _configure_haar(self) -> bool:
+        """Configure the low-cost detector used when YuNet is unavailable."""
+        self._haar = None
+
         cascade_paths = []
         if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
             cascade_paths.append(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
@@ -96,13 +107,12 @@ class VisionService:
                 self._haar = cv2.CascadeClassifier(str(path))
                 if not self._haar.empty():
                     self._backend = "haar-session-fallback"
-                    return
-
-        print("[VisionService] Warning: No YuNet or Haar face detection models found. Running video stream in streaming-only mode.")
-        self._backend = "video-only-fallback"
+                    return True
+        return False
 
     def _open_camera(self) -> None:
         if Picamera2 is not None and os.name != "nt":
+            camera = None
             try:
                 camera = Picamera2()
                 try:
@@ -128,6 +138,21 @@ class VisionService:
                     camera.close()
                     print("[VisionService] Picamera2 started but capture_array returned empty frame.")
             except Exception as exc:
+                if camera is not None:
+                    try:
+                        camera.stop()
+                    except Exception:
+                        pass
+                    try:
+                        camera.close()
+                    except Exception:
+                        pass
+                message = str(exc).strip()
+                if "sequence did not complete" in message.lower() or "busy" in message.lower():
+                    raise RuntimeError(
+                        "CSI camera is busy or owned by another process; "
+                        "stop the other camera process and AURUS will reconnect"
+                    ) from exc
                 print(f"[VisionService] Picamera2 failed: {exc}. Trying OpenCV Video4Linux fallback...")
         elif os.name != "nt" and Picamera2 is None:
             print("[VisionService] Note: python3-picamera2 library not found in current Python environment. If using a venv on Raspberry Pi, ensure it was created with --system-site-packages.")
@@ -165,10 +190,12 @@ class VisionService:
     def _close_camera(self) -> None:
         camera = self._camera
         self._camera = None
+        camera_kind = self._camera_kind
+        self._camera_kind = "none"
         if camera is None:
             return
         try:
-            if self._camera_kind == "picamera2":
+            if camera_kind == "picamera2":
                 camera.stop()
                 camera.close()
             else:
@@ -194,8 +221,24 @@ class VisionService:
         resized = cv2.resize(frame, (self.width, self.height))
         detections = []
         if self._detector is not None:
-            self._detector.setInputSize((self.width, self.height))
-            _, faces = self._detector.detect(resized)
+            try:
+                self._detector.setInputSize((self.width, self.height))
+                _, faces = self._detector.detect(resized)
+            except Exception as exc:
+                # Older Pi OS OpenCV builds can reject newer YuNet graphs or
+                # particular dynamic input shapes. Degrade once instead of
+                # retrying the same failing DNN on every frame.
+                if not self._dnn_fallback_reported:
+                    print(
+                        f"[VisionService] YuNet inference unavailable ({str(exc)[:180]}). "
+                        "Falling back to Haar detection."
+                    )
+                    self._dnn_fallback_reported = True
+                self._detector = None
+                self._recognizer = None
+                if not self._configure_haar():
+                    self._backend = "video-only-fallback"
+                return self._detect(frame)
             if faces is not None:
                 for face in faces:
                     x, y, w, h = [int(value) for value in face[:4]]
@@ -299,6 +342,7 @@ class VisionService:
             self._set_error(f"Model configuration failed: {exc}")
             return
 
+        reconnect_delay = 2.0
         while not self._stop.is_set():
             started = time.monotonic()
             if self._camera is None:
@@ -306,8 +350,10 @@ class VisionService:
                     self._open_camera()
                 except Exception as exc:
                     self._set_error(f"Waiting for camera: {exc}")
-                    self._stop.wait(2.0)
+                    self._stop.wait(reconnect_delay)
+                    reconnect_delay = min(30.0, reconnect_delay * 1.7)
                     continue
+                reconnect_delay = 2.0
 
             frame = self._read_frame()
             if frame is None:

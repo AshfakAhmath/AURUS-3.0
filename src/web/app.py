@@ -26,6 +26,9 @@ def create_app(runtime):
 
     runtime.set_event_sink(lambda event, payload: socketio.emit(event, payload))
 
+    def payload(data):
+        return data if isinstance(data, dict) else {}
+
     @app.get("/")
     def index():
         return render_template("index.html")
@@ -62,6 +65,7 @@ def create_app(runtime):
     @socketio.on("manual_drive")
     def manual_drive(data):
         try:
+            data = payload(data)
             accepted = runtime.manual_drive(
                 float(data.get("vx", 0.0)),
                 float(data.get("vy", 0.0)),
@@ -85,7 +89,7 @@ def create_app(runtime):
 
     @socketio.on("set_mode")
     def set_mode(data):
-        mode = str((data or {}).get("mode", "idle"))
+        mode = str(payload(data).get("mode", "idle"))
         if not runtime.set_mode(mode):
             emit("command_error", {"message": f"Mode '{mode}' rejected. Clear E-STOP first if latched."})
 
@@ -102,19 +106,19 @@ def create_app(runtime):
 
     @socketio.on("send_text")
     def send_text(data):
-        text = str((data or {}).get("text", "")).strip()
+        text = str(payload(data).get("text", "")).strip()
         if text:
             socketio.start_background_task(runtime.handle_text, text, "text")
 
     @socketio.on("run_mcp_agent")
     def run_mcp_agent(data):
-        command = str((data or {}).get("text", "")).strip()
+        command = str(payload(data).get("text", "")).strip()
         if command:
             socketio.start_background_task(runtime.mcp_agent.execute_command, command)
 
     @socketio.on("enroll_person")
     def enroll_person(data):
-        name = str((data or {}).get("name", "")).strip()
+        name = str(payload(data).get("name", "")).strip()
         try:
             status = runtime.start_enrollment(name)
             socketio.emit("enrollment_progress", status.as_dict())
@@ -123,7 +127,7 @@ def create_app(runtime):
 
     @socketio.on("remember_fact")
     def remember_fact(data):
-        fact = str((data or {}).get("text", "")).strip()
+        fact = str(payload(data).get("text", "")).strip()
         try:
             ok, message = runtime.remember_fact(fact)
             socketio.emit("conversation", {"source": "memory", "transcript": fact, "response": message, "provider": "local", "fallback_reason": "" if ok else "identity required"})

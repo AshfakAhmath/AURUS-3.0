@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -36,13 +37,16 @@ class SensorSampler:
     def sample_once(self) -> SensorSnapshot:
         try:
             values = self.sensor.read_all()
+            distances = {key: float(values[key]) for key in ("fl", "f", "fr", "rl", "rr")}
+            if not all(math.isfinite(value) and value >= 0.0 for value in distances.values()):
+                raise ValueError("sensor returned a non-finite or negative distance")
             snapshot = SensorSnapshot(
                 timestamp=time.monotonic(),
-                fl=float(values["fl"]),
-                f=float(values["f"]),
-                fr=float(values["fr"]),
-                rl=float(values["rl"]),
-                rr=float(values["rr"]),
+                fl=distances["fl"],
+                f=distances["f"],
+                fr=distances["fr"],
+                rl=distances["rl"],
+                rr=distances["rr"],
                 healthy=True,
                 error="",
             )

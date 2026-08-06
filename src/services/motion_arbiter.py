@@ -103,6 +103,8 @@ class MotionArbiter:
         with self._lock:
             if self._estop:
                 return False
+            if any((bounded.vx, bounded.vy, bounded.omega)) and not self._dashboard_connected:
+                return False
             current_is_moving = any((self._command.vx, self._command.vy, self._command.omega))
             if current_is_moving and not self._command.expired and bounded.priority < self._command.priority:
                 return False
@@ -145,6 +147,9 @@ class MotionArbiter:
             return MotionDecision(now, command, 0.0, 0.0, 0.0, False, "command expired (deadman stop)")
         if sensors.is_stale(self.stale_after):
             return MotionDecision(now, command, 0.0, 0.0, 0.0, False, "sensor data stale or unhealthy")
+        distances = (sensors.fl, sensors.f, sensors.fr, sensors.rl, sensors.rr)
+        if not all(math.isfinite(value) and value >= 0.0 for value in distances):
+            return MotionDecision(now, command, 0.0, 0.0, 0.0, False, "sensor data invalid")
 
         vx, vy, omega = command.vx, command.vy, command.omega
         reason = "allowed"

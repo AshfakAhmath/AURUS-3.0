@@ -1,5 +1,10 @@
 import sys
 import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 try:
     import pyaudio
@@ -9,8 +14,7 @@ except ImportError:
 
 def main():
     p = pyaudio.PyAudio()
-    info = p.get_host_api_info_by_index(0)
-    numdevices = info.get('deviceCount')
+    numdevices = p.get_device_count()
     
     print("=========================================================")
     print("                AVAILABLE AUDIO DEVICES                  ")
@@ -18,7 +22,7 @@ def main():
     
     input_devices = []
     for i in range(0, numdevices):
-        dev_info = p.get_device_info_by_host_api_device_index(0, i)
+        dev_info = p.get_device_info_by_index(i)
         if dev_info.get('maxInputChannels') > 0:
             print(f"Device ID {i}: {dev_info.get('name')} (Max Input Channels: {dev_info.get('maxInputChannels')})")
             input_devices.append(i)
@@ -43,21 +47,18 @@ def main():
             print(f"Warning: Invalid MIC_INDEX in .env: '{mic_idx}'. Defaulting to auto-selection.")
             device_index = input_devices[0]
     else:
-        print("No MIC_INDEX set in .env. PyAudio will auto-select default device.")
-        device_index = None # Default device
+        print("No MIC_INDEX set in .env. AURUS will prefer a physical USB microphone.")
+        device_index = None
         
     print("\nStarting 3-second recording test. Speak into the microphone now...")
     
     try:
         # 16000 Hz, 1 channel, 16-bit PCM (same as Vosk settings)
-        stream = p.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=1024,
-            input_device_index=device_index
-        )
+        from src.services.speech_service import SpeechService
+
+        probe = SpeechService(model_path=Path("models") / "vosk-model-small-en-us-0.15", microphone_index=device_index)
+        stream = probe._open_stream(p)
+        print(f"Testing device ID {probe.selected_microphone_index}: {probe.selected_microphone_name}")
         
         frames = []
         for _ in range(0, int(16000 / 1024 * 3)):

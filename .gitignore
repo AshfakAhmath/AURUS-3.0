@@ -31,9 +31,12 @@ env/
 
 # Runtime data, downloaded models, and logs
 models/*.onnx
+models/*.gguf
 models/vosk-model-*/
+models/sherpa-onnx-kws-*/
 models/*.json
 models/*.zip
+models/*.tar.bz2
 models/*.part
 aurus_memory.db
 *.legacy-backup.db

@@ -8,17 +8,23 @@ import importlib.util
 import queue
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
+import wave
 
 
 class TTSService:
-    def __init__(self, piper_model: str | Path | None = None):
+    def __init__(
+        self,
+        piper_model: str | Path | None = None,
+        playback_active: threading.Event | None = None,
+    ):
         self.piper_model = Path(piper_model) if piper_model else None
+        self.playback_active = playback_active or threading.Event()
         self._queue: queue.Queue[str | None] = queue.Queue(maxsize=8)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._piper_voice = None
         self.backend = self._select_backend()
         self.error = "" if self.backend != "visual" else "No local TTS executable available"
 
@@ -50,6 +56,7 @@ class TTSService:
             pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        self.playback_active.clear()
 
     def speak(self, text: str) -> bool:
         clean = " ".join(text.strip().split())[:400]
@@ -73,16 +80,15 @@ class TTSService:
             raise RuntimeError("no WAV player available")
 
     def _speak_piper(self, text: str) -> None:
+        if self._piper_voice is None:
+            from piper import PiperVoice
+
+            self._piper_voice = PiperVoice.load(str(self.piper_model))
         handle = tempfile.NamedTemporaryFile(prefix="aurus-", suffix=".wav", delete=False)
         handle.close()
         try:
-            subprocess.run(
-                [sys.executable, "-m", "piper", "-m", str(self.piper_model), "-f", handle.name, "--", text],
-                check=True,
-                timeout=30,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            with wave.open(handle.name, "wb") as wav_file:
+                self._piper_voice.synthesize_wav(text, wav_file)
             self._play_wav(handle.name)
         finally:
             try:
@@ -104,16 +110,21 @@ class TTSService:
                 continue
             if text is None:
                 break
+            self.playback_active.set()
             try:
                 self._speak(text)
                 self.error = ""
             except Exception as exc:
                 self.error = str(exc)[:200]
-                if self.backend == "piper" and shutil.which("espeak-ng"):
-                    self.backend = "espeak-ng"
+                fallback = "espeak-ng" if shutil.which("espeak-ng") else "espeak" if shutil.which("espeak") else None
+                if self.backend == "piper" and fallback:
+                    self.backend = fallback
+                    self._piper_voice = None
                     try:
                         self._speak(text)
                     except Exception:
                         self.backend = "visual"
                 else:
                     self.backend = "visual"
+            finally:
+                self.playback_active.clear()

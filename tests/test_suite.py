@@ -382,6 +382,15 @@ class TestMotorAnimationCancellation(unittest.TestCase):
         self.assertEqual(state["vx"], 0.0)
         self.assertEqual(state["vy"], 0.0)
 
+    def test_replacing_animation_joins_previous_thread(self):
+        """Verify a replacement cannot overlap the previous animation."""
+        self.driver.wiggle(0.5)
+        previous = self.driver._animation_thread
+        self.driver.spin(0.1)
+        self.assertFalse(previous.is_alive())
+        self.assertIsNot(self.driver._animation_thread, previous)
+        self.driver.stop()
+
 
 class TestMotorWatchdog(unittest.TestCase):
     """P2 #15: Tests for motor watchdog timer (P1 #7 fix)."""

@@ -21,7 +21,12 @@ if MIC_INDEX and MIC_INDEX.lower() not in ["none", "null"]:
 else:
     MIC_INDEX = None
 
-AURUS_RECORD_SECONDS = float(os.getenv("AURUS_RECORD_SECONDS", "6.0"))
+try:
+    AURUS_RECORD_SECONDS = float(
+        os.getenv("AURUS_MAX_UTTERANCE_SECONDS", os.getenv("AURUS_RECORD_SECONDS", "10.0"))
+    )
+except ValueError:
+    AURUS_RECORD_SECONDS = 10.0
 
 # Headless audio playback command (aplay for Raspbian Linux, mock/print on Windows)
 import platform

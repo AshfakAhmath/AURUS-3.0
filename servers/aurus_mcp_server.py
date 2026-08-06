@@ -9,16 +9,18 @@ Launch:
     python servers/aurus_mcp_server.py          # stdio mode (for IDE integration)
 
 The server manages its own MecanumDriver, ProximitySensor, and TTSService
-instances.  It does NOT interfere with the main AURUS runtime — they can
-run side-by-side or independently.
+instances and must be run independently of the main AURUS runtime. The motor
+driver enforces exclusive process ownership of the GPIO outputs.
 """
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -56,6 +58,9 @@ if FastMCP is None:
 from src.hardware.motors import MecanumDriver
 from src.hardware.sensors import ProximitySensor
 from src.memory.repository import MemoryRepository
+from src.core.models import RobotMode
+from src.services.motion_arbiter import MotionArbiter
+from src.services.sensor_sampler import SensorSampler
 
 # Optional imports — degrade gracefully when dependencies are missing
 try:
@@ -71,22 +76,97 @@ _driver: MecanumDriver | None = None
 _sensor: ProximitySensor | None = None
 _repo: MemoryRepository | None = None
 _tts: TTSService | None = None
+_sampler: SensorSampler | None = None
+_arbiter: MotionArbiter | None = None
+_motion_lock = threading.Lock()
 
 
 def _init_hardware() -> None:
     """Lazily initialize hardware singletons on first tool call."""
-    global _driver, _sensor, _repo, _tts
+    global _driver, _sensor, _repo, _tts, _sampler, _arbiter
 
     if _driver is not None:
         return  # Already initialized
 
-    _driver = MecanumDriver()
-    _sensor = ProximitySensor(_driver)
-    _repo = MemoryRepository(PROJECT_ROOT / "aurus_memory.db")
+    try:
+        _driver = MecanumDriver()
+        _sensor = ProximitySensor(_driver)
+        _repo = MemoryRepository(PROJECT_ROOT / "aurus_memory.db")
+        _sampler = SensorSampler(_sensor)
+        _sampler.sample_once()
+        _sampler.start()
+        _arbiter = MotionArbiter(_driver, _sampler)
+        _arbiter.set_dashboard_connected(True)
+        _arbiter.start()
 
-    if _HAS_TTS:
-        _tts = TTSService(os.getenv("PIPER_MODEL_PATH"))
-        _tts.start()
+        if _HAS_TTS:
+            _tts = TTSService(os.getenv("PIPER_MODEL_PATH"))
+            _tts.start()
+    except Exception:
+        _shutdown_hardware()
+        _driver = None
+        _sensor = None
+        _repo = None
+        _tts = None
+        _sampler = None
+        _arbiter = None
+        raise
+
+
+def _shutdown_hardware() -> None:
+    actions = []
+    if _arbiter is not None:
+        actions.extend((
+            lambda: _arbiter.emergency_stop("MCP server shutdown"),
+            _arbiter.stop,
+        ))
+    if _sampler is not None:
+        actions.append(_sampler.stop)
+    if _tts is not None:
+        actions.append(_tts.stop)
+    if _driver is not None:
+        actions.append(_driver.cleanup)
+    for action in actions:
+        try:
+            action()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_hardware)
+
+
+def _execute_motion_sequence(
+    steps: list[tuple[float, float, float, float]],
+) -> tuple[bool, str]:
+    """Execute standalone MCP motion through the shared safety arbiter."""
+    _init_hardware()
+    if not _motion_lock.acquire(blocking=False):
+        return False, "another motion command is already running"
+    try:
+        if not _arbiter.set_mode(RobotMode.PERFORMING):
+            return False, "emergency stop is latched"
+        for vx, vy, omega, duration in steps:
+            if not _arbiter.command(
+                "standalone-mcp", vx, vy, omega, ttl=max(0.1, duration + 0.1), priority=60
+            ):
+                return False, "motion command was rejected"
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                if _arbiter.estopped:
+                    return False, "emergency stop is latched"
+                if _arbiter.mode != RobotMode.PERFORMING:
+                    return False, "motion was interrupted"
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                decision = _arbiter.get_decision()
+                if decision.requested.source == "standalone-mcp" and not decision.allowed:
+                    return False, decision.reason
+        return True, "completed"
+    finally:
+        _arbiter.halt("standalone-mcp-stop")
+        if not _arbiter.estopped and _arbiter.mode == RobotMode.PERFORMING:
+            _arbiter.set_mode(RobotMode.IDLE)
+        _motion_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -148,18 +228,16 @@ def move_rover(
         })
 
     vx, vy, omega = velocities
-    _driver.drive(vx, vy, omega)
-    time.sleep(duration)
-    _driver.stop()
+    completed, reason = _execute_motion_sequence([(vx, vy, omega, duration)])
 
     state = _driver.get_simulation_state()
     res = {
-        "status": "ok",
+        "status": "ok" if completed else "blocked",
         "direction": direction,
         "speed": speed,
         "duration_s": duration,
         "simulation_mode": _driver.is_simulation,
-        "message": f"Moved {direction} for {duration}s at {int(speed*100)}% power." + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
+        "message": (f"Moved {direction} for {duration}s at {int(speed*100)}% power." if completed else f"Movement stopped: {reason}.") + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
         "position": {
             "x_cm": round(state["x"], 1),
             "y_cm": round(state["y"], 1),
@@ -185,21 +263,21 @@ def spin_rover(
         duration: Seconds to spin.
     """
     _init_hardware()
+    if direction.lower() not in ("left", "right"):
+        return json.dumps({"status": "error", "message": f"Unknown spin direction '{direction}'."})
     speed = max(0.0, min(1.0, speed))
     duration = max(0.1, min(10.0, duration))
     omega = speed if direction.lower() == "left" else -speed
 
-    _driver.drive(0, 0, omega)
-    time.sleep(duration)
-    _driver.stop()
+    completed, reason = _execute_motion_sequence([(0.0, 0.0, omega, duration)])
 
     state = _driver.get_simulation_state()
     res = {
-        "status": "ok",
+        "status": "ok" if completed else "blocked",
         "spin_direction": direction,
         "duration_s": duration,
         "simulation_mode": _driver.is_simulation,
-        "message": f"Spun {direction} for {duration}s at {int(speed*100)}% power." + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
+        "message": (f"Spun {direction} for {duration}s at {int(speed*100)}% power." if completed else f"Spin stopped: {reason}.") + (" (IN SIMULATION MODE - NO PHYSICAL MOTOR MOVEMENT)" if _driver.is_simulation else ""),
         "heading_deg": round(state["theta"] * 57.2958, 1),
     }
     if _driver.is_simulation:
@@ -212,7 +290,9 @@ def stop_rover() -> str:
     """Immediately stop all motors.  Call this after any movement is complete
     or if you need an emergency stop."""
     _init_hardware()
-    _driver.stop()
+    _arbiter.halt("standalone-mcp-stop")
+    if not _arbiter.estopped:
+        _arbiter.set_mode(RobotMode.IDLE)
     return json.dumps({"status": "ok", "message": "All motors stopped."})
 
 
@@ -224,21 +304,23 @@ def perform_animation(name: str) -> str:
         name: One of 'wiggle' (happy), 'shiver' (scared), 'spin' (curious).
     """
     _init_hardware()
-    animations = {
-        "wiggle": lambda: _driver.wiggle(duration=1.5),
-        "shiver": lambda: _driver.shiver(duration=1.2),
-        "spin":   lambda: _driver.spin(duration=1.5),
+    animations: dict[str, list[tuple[float, float, float, float]]] = {
+        "wiggle": [(0.0, direction * 0.6, 0.0, 0.15) for _ in range(5) for direction in (1, -1)],
+        "shiver": [(direction * 0.4, 0.0, 0.0, 0.05) for _ in range(12) for direction in (1, -1)],
+        "spin": [(0.0, 0.0, 0.6, 1.5)],
     }
-    func = animations.get(name.lower())
-    if func is None:
+    sequence = animations.get(name.lower())
+    if sequence is None:
         return json.dumps({
             "status": "error",
             "message": f"Unknown animation '{name}'. Use one of: {', '.join(animations.keys())}",
         })
-    func()
-    # Wait for the animation to finish (they run in threads)
-    time.sleep(2.0)
-    return json.dumps({"status": "ok", "animation": name, "message": f"Played '{name}' animation."})
+    completed, reason = _execute_motion_sequence(sequence)
+    return json.dumps({
+        "status": "ok" if completed else "blocked",
+        "animation": name,
+        "message": f"Played '{name}' animation." if completed else f"Animation stopped: {reason}.",
+    })
 
 
 # ── Sensor Tools ───────────────────────────────────────────────────────────
@@ -259,12 +341,21 @@ def read_sensors() -> str:
     Values below 15 cm indicate an obstacle is dangerously close.
     """
     _init_hardware()
-    readings = _sensor.read_all()
+    snapshot = _sampler.get_snapshot()
+    readings = {
+        "fl": snapshot.fl,
+        "f": snapshot.f,
+        "fr": snapshot.fr,
+        "rl": snapshot.rl,
+        "rr": snapshot.rr,
+    }
     front_min = min(readings["fl"], readings["f"], readings["fr"])
     rear_min = min(readings["rl"], readings["rr"])
     return json.dumps({
         "status": "ok",
         "simulation_mode": _sensor.is_simulation,
+        "healthy": snapshot.healthy and not snapshot.is_stale(),
+        "error": snapshot.error,
         "distances_cm": {k: round(v, 1) for k, v in readings.items()},
         "front_min_cm": round(front_min, 1),
         "rear_min_cm": round(rear_min, 1),
@@ -433,6 +524,11 @@ def remember_fact(fact: str, user_id: int = 1) -> str:
         user_id: ID of the person this fact is about (default 1).
     """
     _init_hardware()
+    if _repo.get_user(user_id) is None:
+        return json.dumps({
+            "status": "error",
+            "message": f"Unknown user_id {user_id}; enroll or recognize a person first.",
+        })
     _repo.remember(user_id, fact)
     return json.dumps({"status": "ok", "message": f"Remembered: {fact}"})
 
@@ -445,6 +541,11 @@ def recall_memories(user_id: int = 1) -> str:
         user_id: ID of the person to recall facts about (default 1).
     """
     _init_hardware()
+    if _repo.get_user(user_id) is None:
+        return json.dumps({
+            "status": "error",
+            "message": f"Unknown user_id {user_id}; enroll or recognize a person first.",
+        })
     facts = _repo.memories_for(user_id)
     return json.dumps({
         "status": "ok",

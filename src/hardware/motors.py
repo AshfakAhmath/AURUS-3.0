@@ -2,6 +2,9 @@ import time
 import sys
 import threading
 import math
+import os
+from pathlib import Path
+import tempfile
 
 # Try importing RPi.GPIO; if it fails, run in simulation mode
 try:
@@ -37,14 +40,22 @@ class MecanumDriver:
         # P0 #4: Animation cancellation — prevents stacking and allows clean interrupts
         self._animation_cancel = threading.Event()
         self._animation_cancel.set()  # Start in cancelled state (no animation running)
-        self._animation_lock = threading.Lock()  # Prevents concurrent animation starts
+        self._animation_lock = threading.Lock()  # Protects animation replacement
+        self._animation_thread = None
 
         # P1 #7: Motor watchdog — auto-stop motors if no drive() call within timeout
         self._last_drive_time = time.time()
         self._motors_active = False  # Track if motors are currently driving
+        self._cleaned = False
+        self._hardware_lock_file = None
 
         if not self.is_simulation:
-            self._setup_hardware()
+            self._acquire_hardware_lock()
+            try:
+                self._setup_hardware()
+            except Exception:
+                self._release_hardware_lock()
+                raise
         else:
             print("--- RUNNING IN MOTOR SIMULATION MODE ---")
             
@@ -52,6 +63,42 @@ class MecanumDriver:
         self.running = True
         self.sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
         self.sim_thread.start()
+
+    def _acquire_hardware_lock(self):
+        """Prevent two AURUS processes from owning the same GPIO motor pins."""
+        try:
+            import fcntl
+        except ImportError:
+            return
+
+        lock_path = Path(tempfile.gettempdir()) / "aurus-motor-hardware.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                "AURUS motor hardware is already owned by another process. "
+                "Stop the other runtime or MCP server before starting this one."
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._hardware_lock_file = handle
+
+    def _release_hardware_lock(self):
+        handle = self._hardware_lock_file
+        self._hardware_lock_file = None
+        if handle is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        handle.close()
 
     def _setup_hardware(self):
         GPIO.setmode(GPIO.BCM)
@@ -189,18 +236,33 @@ class MecanumDriver:
     def stop(self):
         """Stop all motors and cancel any running animation."""
         self._cancel_animation()
+        animation = self._animation_thread
+        if animation and animation.is_alive() and animation is not threading.current_thread():
+            animation.join(timeout=0.4)
         self.drive(0, 0, 0)
 
     def _cancel_animation(self):
         """Signal any running animation to stop immediately (P0 #4)."""
         self._animation_cancel.set()
 
+    def _start_animation(self, target, name):
+        """Cancel and join the previous animation before starting its replacement."""
+        with self._animation_lock:
+            self._animation_cancel.set()
+            previous = self._animation_thread
+            if previous and previous.is_alive() and previous is not threading.current_thread():
+                previous.join(timeout=0.4)
+                if previous.is_alive():
+                    return
+            self._animation_cancel.clear()
+            self._animation_thread = threading.Thread(target=target, name=name, daemon=True)
+            self._animation_thread.start()
+
     def wiggle(self, duration=1.5):
         """Happy wiggle animation (rapid side strafes).
         P0 #4: Uses animation lock to prevent stacking and cancel event for clean interrupts."""
         def run_wiggle():
-            with self._animation_lock:
-                self._animation_cancel.clear()
+            try:
                 end_time = time.time() + duration
                 step = 0.15
                 while time.time() < end_time:
@@ -212,17 +274,16 @@ class MecanumDriver:
                         break
                     self.drive(0, -0.6, 0)
                     time.sleep(step)
+            finally:
                 self.drive(0, 0, 0)  # Don't call stop() to avoid recursive cancel
                 self._animation_cancel.set()
-        self._cancel_animation()  # Cancel any running animation first
-        threading.Thread(target=run_wiggle, daemon=True).start()
+        self._start_animation(run_wiggle, "motor-wiggle")
 
     def shiver(self, duration=1.2):
         """Scared shiver animation (high-speed microscopic forward/backward wiggles).
         P0 #4: Uses animation lock to prevent stacking and cancel event for clean interrupts."""
         def run_shiver():
-            with self._animation_lock:
-                self._animation_cancel.clear()
+            try:
                 end_time = time.time() + duration
                 step = 0.05
                 while time.time() < end_time:
@@ -234,27 +295,26 @@ class MecanumDriver:
                         break
                     self.drive(-0.4, 0, 0)
                     time.sleep(step)
+            finally:
                 self.drive(0, 0, 0)
                 self._animation_cancel.set()
-        self._cancel_animation()
-        threading.Thread(target=run_shiver, daemon=True).start()
+        self._start_animation(run_shiver, "motor-shiver")
 
     def spin(self, duration=1.5, direction=1):
         """Spin in place.
         P0 #4: Uses animation lock to prevent stacking and cancel event for clean interrupts."""
         def run_spin():
-            with self._animation_lock:
-                self._animation_cancel.clear()
+            try:
                 self.drive(0, 0, 0.6 * direction)
                 start = time.time()
                 while time.time() - start < duration:
                     if self._animation_cancel.is_set():
                         break
                     time.sleep(0.05)
+            finally:
                 self.drive(0, 0, 0)
                 self._animation_cancel.set()
-        self._cancel_animation()
-        threading.Thread(target=run_spin, daemon=True).start()
+        self._start_animation(run_spin, "motor-spin")
 
     def _sim_loop(self):
         """Updates simulated coordinates of the Rover and runs motor watchdog."""
@@ -324,7 +384,30 @@ class MecanumDriver:
             self.sim_omega = 0.0
 
     def cleanup(self):
+        if self._cleaned:
+            return
+        self._cleaned = True
         self.running = False
-        if not self.is_simulation and GPIO is not None:
-            self.stop()
-            GPIO.cleanup()
+        try:
+            try:
+                self.stop()
+            finally:
+                animation = self._animation_thread
+                if animation and animation.is_alive() and animation is not threading.current_thread():
+                    animation.join(timeout=1.0)
+                if self.sim_thread.is_alive():
+                    self.sim_thread.join(timeout=1.0)
+                if not self.is_simulation and GPIO is not None:
+                    # rpi-lgpio's PWM destructor calls stop() again. Release
+                    # every PWM object while the GPIO chip handle is still
+                    # valid, before the process-wide GPIO cleanup closes it.
+                    while self.pwm_channels:
+                        _, channel = self.pwm_channels.popitem()
+                        try:
+                            channel.stop()
+                        except Exception:
+                            pass
+                        del channel
+                    GPIO.cleanup()
+        finally:
+            self._release_hardware_lock()
